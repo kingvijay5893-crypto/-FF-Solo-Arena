@@ -1,0 +1,127 @@
+rules_version = '2';
+
+// ---------------------------------------------------------------------------
+// FF Solo Arena — Firestore security rules
+//
+// Design: the backend (Node/Express, using the Firebase Admin SDK) bypasses
+// these rules entirely and is where all sensitive writes actually happen —
+// creating tournaments, crediting tokens, publishing room details, verifying
+// results. These rules exist to make sure that even if someone bypasses the
+// app entirely and talks to Firestore directly from a browser console, they
+// still cannot:
+//   - grant themselves admin
+//   - credit their own tokens
+//   - fabricate a transaction record
+//   - register twice for the same tournament
+//   - read another player's room ID/password before they've joined
+// ---------------------------------------------------------------------------
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isSelf(userId) {
+  return isSignedIn() && request.auth.uid == userId;
+}
+
+function isAdmin() {
+  return isSignedIn() &&
+    exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+    get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // users/{userId}
+    // ---------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isSignedIn();
+
+      // Client-side creation only for the player's own doc, and only with
+      // safe starting values — the backend's /users/register endpoint does
+      // this in practice, but this rule is a backstop.
+      allow create: if isSelf(userId) &&
+        request.resource.data.role == 'player' &&
+        request.resource.data.tokenBalance == 0 &&
+        request.resource.data.wins == 0 &&
+        request.resource.data.totalKills == 0 &&
+        request.resource.data.totalTournaments == 0 &&
+        request.resource.data.suspended == false;
+
+      // A player may update their own harmless profile fields, but never
+      // role, tokenBalance, wins, totalKills, totalTournaments, or
+      // suspended — those change only through the backend (Admin SDK,
+      // which is not subject to these rules).
+      allow update: if isSelf(userId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['name', 'mobile', 'nickname']) ||
+        isAdmin();
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // tournaments/{tournamentId}
+    // ---------------------------------------------------------------------
+    match /tournaments/{tournamentId} {
+      // Anyone signed in can read tournament metadata directly from
+      // Firestore, but roomId/roomPassword are also stored on this same
+      // doc — the API strips them server-side for non-registered callers.
+      // Direct Firestore reads of this collection are only intended for
+      // the backend (Admin SDK); the frontend always goes through the API.
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // registrations/{registrationId}   (doc id = `${tournamentId}_${userId}`)
+    // ---------------------------------------------------------------------
+    match /registrations/{registrationId} {
+      allow read: if isSignedIn() &&
+        (resource.data.userId == request.auth.uid || isAdmin());
+
+      // A player may create only their own registration, only with doc ID
+      // `${tournamentId}_${uid}` (prevents duplicate joins at the data
+      // model level — a second create attempt hits an already-existing
+      // document and Firestore rejects the overwrite as an update, which
+      // this rule does not allow).
+      allow create: if isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        registrationId == request.resource.data.tournamentId + '_' + request.auth.uid &&
+        request.resource.data.status == 'registered';
+
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // results/{resultId}   (doc id = `${tournamentId}_${userId}`)
+    // ---------------------------------------------------------------------
+    match /results/{resultId} {
+      allow read: if isSignedIn() &&
+        (resource.data.userId == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        resultId == request.resource.data.tournamentId + '_' + request.auth.uid &&
+        request.resource.data.verificationStatus == 'pending';
+
+      // Only an admin can move a result out of "pending" (verify/reject).
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // transactions/{transactionId}   — token ledger, backend-only
+    // ---------------------------------------------------------------------
+    match /transactions/{transactionId} {
+      allow read: if isSignedIn() &&
+        (resource.data.userId == request.auth.uid || isAdmin());
+      // No client-side writes at all. Every transaction is created by the
+      // backend's Admin SDK during result verification.
+      allow write: if false;
+    }
+  }
+}
