@@ -1,0 +1,21 @@
+rules_version = '2';
+
+// Result screenshots live at results/{tournamentId}/{uid}-{timestamp}-{filename}
+// Players may only upload under their own uid segment; anyone signed in may
+// read (admins need to review screenshots, and result cards link to them).
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /results/{tournamentId}/{fileName} {
+      allow read: if request.auth != null;
+
+      allow write: if request.auth != null &&
+        fileName.matches(request.auth.uid + '-.*') &&
+        request.resource.size < 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
